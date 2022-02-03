@@ -641,13 +641,9 @@ impl Config {
         {
             Some(cmd_line_qs.to_owned())
         } else if std::env::var_os("QUOTING_STYLE").is_some() {
-            if let Some(parsed) = Self::parse_byte_count(
+            Self::parse_byte_count(
                 &std::env::var_os("QUOTING_STYLE").unwrap().to_string_lossy(),
-            ) {
-                Some(parsed.to_string())
-            } else {
-                None
-            }
+            ).map(|parsed| parsed.to_string())
         } else {
             None
         };
