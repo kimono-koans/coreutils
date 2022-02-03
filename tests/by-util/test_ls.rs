@@ -168,16 +168,6 @@ fn test_ls_allocation_size() {
             .ucmd()
             .env("BLOCK_SIZE", "4K")
             .arg("-s1")
-            .arg("--si")
-            .arg("some-dir1")
-            .succeeds()
-            .stdout_contains("0 empty-file")
-            .stdout_contains("4.2M file-with-holes");
-
-        scene
-            .ucmd()
-            .env("BLOCK_SIZE", "4K")
-            .arg("-s1")
             .arg("some-dir1")
             .succeeds()
             .stdout_contains("0 empty-file")
@@ -220,6 +210,7 @@ fn test_ls_allocation_size() {
             .stdout_contains("0 empty-file")
             .stdout_contains("8192 file-with-holes");
 
+        // -k should make us ignore the env var
         scene
             .ucmd()
             .env("BLOCK_SIZE", "4K")

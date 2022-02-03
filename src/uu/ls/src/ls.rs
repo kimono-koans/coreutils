@@ -317,7 +317,6 @@ struct Config {
     long: LongFormat,
     alloc_size: bool,
     block_size: Option<usize>,
-    kibibytes: bool,
     width: u16,
     quoting_style: QuotingStyle,
     indicator_style: IndicatorStyle,
@@ -519,7 +518,18 @@ impl Config {
 
         let mut size_format = SizeFormat::Bytes;
 
-        let block_size = if (options.is_present(options::size::BLOCK_SIZE)
+        let block_size = if options.is_present(options::size::BLOCK_SIZE)
+            && !options
+                .value_of(options::size::BLOCK_SIZE)
+                .unwrap()
+                .eq("si")
+            && !options
+                .value_of(options::size::BLOCK_SIZE)
+                .unwrap()
+                .eq("human-readable")
+        {
+            Self::parse_byte_count(options.value_of(options::size::BLOCK_SIZE).unwrap())
+        } else if (options.is_present(options::size::BLOCK_SIZE)
             && options
                 .value_of(options::size::BLOCK_SIZE)
                 .unwrap()
@@ -537,12 +547,32 @@ impl Config {
         {
             size_format = SizeFormat::Binary;
             None
-        } else if options.is_present(options::size::BLOCK_SIZE) {
-            Self::parse_byte_count(options.value_of(options::size::BLOCK_SIZE).unwrap())
-        } else if std::env::var_os("LS_BLOCK_SIZE").is_some() {
-            Self::parse_byte_count(&std::env::var_os("LS_BLOCK_SIZE").unwrap().to_string_lossy())
-        } else if std::env::var_os("BLOCK_SIZE").is_some() {
-            Self::parse_byte_count(&std::env::var_os("BLOCK_SIZE").unwrap().to_string_lossy())
+        } else if options.is_present(options::size::KIBIBYTES) {
+            None
+        } else if let Some(x) = &std::env::var_os("LS_BLOCK_SIZE") {
+            if !x.eq(&OsString::from("si")) && !x.eq(&OsString::from("si")) {
+                Self::parse_byte_count(&x.to_string_lossy())
+            } else if x.eq(&OsString::from("si")) {
+                size_format = SizeFormat::Decimal;
+                None
+            } else if x.eq(&OsString::from("human-readable")) {
+                size_format = SizeFormat::Binary;
+                None
+            } else {
+                None
+            }
+        } else if let Some(x) = &std::env::var_os("BLOCK_SIZE") {
+            if !x.eq(&OsString::from("si")) && !x.eq(&OsString::from("si")) {
+                Self::parse_byte_count(&x.to_string_lossy())
+            } else if x.eq(&OsString::from("si")) {
+                size_format = SizeFormat::Decimal;
+                None
+            } else if x.eq(&OsString::from("human-readable")) {
+                size_format = SizeFormat::Binary;
+                None
+            } else {
+                None
+            }
         } else if std::env::var_os("POSIXLY_CORRECT").is_some() {
             if std::env::var_os("POSIXLY_CORRECT")
                 .unwrap()
@@ -607,8 +637,23 @@ impl Config {
             !atty::is(atty::Stream::Stdout)
         };
 
-        let quoting_style = if let Some(style) = options.value_of(options::QUOTING_STYLE) {
-            match style {
+        let opt_quoting_style = if let Some(cmd_line_qs) = options.value_of(options::QUOTING_STYLE)
+        {
+            Some(cmd_line_qs.to_owned())
+        } else if std::env::var_os("QUOTING_STYLE").is_some() {
+            if let Some(parsed) = Self::parse_byte_count(
+                &std::env::var_os("QUOTING_STYLE").unwrap().to_string_lossy(),
+            ) {
+                Some(parsed.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let quoting_style = if let Some(style) = opt_quoting_style {
+            match style.as_str() {
                 "literal" => QuotingStyle::Literal { show_control },
                 "shell" => QuotingStyle::Shell {
                     escape: false,
@@ -759,7 +804,6 @@ impl Config {
             long,
             alloc_size: options.is_present(options::size::ALLOCATION_SIZE),
             block_size,
-            kibibytes: options.is_present(options::size::KIBIBYTES),
             width,
             quoting_style,
             indicator_style,
@@ -1765,17 +1809,24 @@ fn pad_right(string: &str, count: usize) -> String {
     format!("{:<width$}", string, width = count)
 }
 
+fn size_to_blocks(size: u64, config: &Config) -> u64 {
+    if config.block_size.is_some() {
+        size / config.block_size.unwrap() as u64
+    } else {
+        size / DEFAULT_BLOCK_SIZE as u64
+    }
+}
+
 fn display_total(items: &[PathData], config: &Config, out: &mut BufWriter<Stdout>) {
     let mut total_size = 0;
     for item in items {
         total_size += item.md(out).as_ref().map_or(0, |md| get_block_size(md));
     }
-    // why not fold into the get_block_size function?  Because kibibytes
-    // only displays here and in the alloc_size/more_info block
-    if config.kibibytes && config.block_size.is_some() {
-        total_size *= (config.block_size.unwrap() / DEFAULT_BLOCK_SIZE) as u64;
-    }
-    let _ = writeln!(out, "total {}", display_size(total_size, config, true));
+    let display_total = match config.size_format {
+        SizeFormat::Bytes => display_size(size_to_blocks(total_size, config), config),
+        _ => display_size(total_size, config),
+    };
+    let _ = writeln!(out, "total {}", display_total);
 }
 
 fn display_more_info(
@@ -1798,13 +1849,15 @@ fn display_more_info(
     }
     if config.alloc_size {
         let s = if let Some(md) = item.md(out) {
-            let mut block_size = get_block_size(md);
-            // why not fold into the get_block_size function?  Because kibibytes
-            // only displays here and in the display_total block
-            if config.kibibytes && config.block_size.is_some() {
-                block_size *= (config.block_size.unwrap() / DEFAULT_BLOCK_SIZE) as u64;
+            match config.size_format {
+                SizeFormat::Bytes => {
+                    display_size(size_to_blocks(get_block_size(md), config), config)
+                }
+                _ => match display_size_or_rdev(md, config) {
+                    SizeOrDeviceId::Device(_, _) => "0".to_string(),
+                    SizeOrDeviceId::Size(size) => size,
+                },
             }
-            display_size(block_size, config, true)
         } else {
             "?".to_owned()
         };
@@ -1839,13 +1892,15 @@ fn display_items(items: &[PathData], config: &Config, out: &mut BufWriter<Stdout
     if config.alloc_size {
         for item in items {
             if let Some(md) = item.md(out) {
-                let mut block_size = get_block_size(md);
-                // why not fold into the get_block_size function?  Because kibibytes
-                // only displays here and in the display_total block
-                if config.kibibytes && config.block_size.is_some() {
-                    block_size *= (config.block_size.unwrap() / DEFAULT_BLOCK_SIZE) as u64;
-                }
-                let block_size_len = display_size(block_size, config, true).len();
+                let block_size_len = match config.size_format {
+                    SizeFormat::Bytes => {
+                        display_size(size_to_blocks(get_block_size(md), config), config).len()
+                    }
+                    _ => match display_size_or_rdev(md, config) {
+                        SizeOrDeviceId::Device(_, _) => 1usize,
+                        SizeOrDeviceId::Size(size) => size.len(),
+                    },
+                };
                 longest_block_size_len = block_size_len.max(longest_block_size_len);
             } else {
                 continue;
@@ -2446,31 +2501,23 @@ fn display_size_or_rdev(metadata: &Metadata, config: &Config) -> SizeOrDeviceId 
             return SizeOrDeviceId::Device(major.to_string(), minor.to_string());
         }
     }
-
-    // matches GNU behavior: show size as blocks when config.block_size is set
-    let is_blocks = config.block_size.is_some();
-    SizeOrDeviceId::Size(display_size(metadata.len(), config, is_blocks))
+    if config.block_size.is_some() {
+        SizeOrDeviceId::Size(display_size(
+            get_block_size(metadata) / config.block_size.unwrap() as u64,
+            config,
+        ))
+    } else {
+        SizeOrDeviceId::Size(display_size(metadata.len(), config))
+    }
 }
 
-fn display_size(size: u64, config: &Config, is_blocks: bool) -> String {
+fn display_size(size: u64, config: &Config) -> String {
     // NOTE: The human-readable behavior deviates from the GNU ls.
     // The GNU ls uses binary prefixes by default.
-    let ls_block_size = if config.alloc_size && is_blocks {
-        if let Some(bs) = config.block_size {
-            // custom block_size for when block_size is set
-            bs as u64
-        } else {
-            // size display in default blocks for when config.block_size is unset
-            DEFAULT_BLOCK_SIZE as u64
-        }
-    } else {
-        // size display in bytes, most common case
-        1u64
-    };
     match config.size_format {
         SizeFormat::Binary => format_prefixed(&NumberPrefix::binary(size as f64)),
         SizeFormat::Decimal => format_prefixed(&NumberPrefix::decimal(size as f64)),
-        SizeFormat::Bytes => (size / ls_block_size).to_string(),
+        SizeFormat::Bytes => size.to_string(),
     }
 }
 
