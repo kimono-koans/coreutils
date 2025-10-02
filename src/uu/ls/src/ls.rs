@@ -1784,6 +1784,7 @@ struct PathData {
     p_buf: PathBuf,
     must_dereference: bool,
     command_line: bool,
+    is_dot: bool,
 }
 
 impl PathData {
@@ -1793,6 +1794,7 @@ impl PathData {
         file_name: Option<OsString>,
         config: &Config,
         command_line: bool,
+        is_dot: bool,
     ) -> Self {
         // We cannot use `Path::ends_with` or `Path::Components`, because they remove occurrences of '.'
         // For '..', the filename is None
@@ -1862,6 +1864,7 @@ impl PathData {
             p_buf,
             must_dereference,
             command_line,
+            is_dot,
         }
     }
 
@@ -2034,6 +2037,7 @@ impl Clone for PathData {
             must_dereference: self.must_dereference,
             security_context: self.security_context.clone(),
             command_line: self.command_line,
+            is_dot: self.is_dot,
         }
     }
 }
@@ -2116,7 +2120,7 @@ pub fn list(locs: Vec<&Path>, config: &Config) -> UResult<()> {
 
     let (mut dirs, mut files): (Vec<PathData>, Vec<PathData>) = locs
         .into_iter()
-        .map(|loc| PathData::new(PathBuf::from(loc), None, None, config, true))
+        .map(|loc| PathData::new(PathBuf::from(loc), None, None, config, true, false))
         .filter(|path_data| {
             // Getting metadata here is no big deal as it's just the CWD
             // and we really just want to know if the strings exist as files/dirs
@@ -2325,6 +2329,7 @@ fn enter_directory(
                 Some(".".into()),
                 config,
                 false,
+                true,
             ),
             PathData::new(
                 path_data.path().join(".."),
@@ -2332,6 +2337,7 @@ fn enter_directory(
                 Some("..".into()),
                 config,
                 false,
+                true,
             ),
         ]
     } else {
@@ -2339,7 +2345,7 @@ fn enter_directory(
     };
 
     // Convert those entries to the PathData struct
-    let iter = read_dir
+    let new_paths = read_dir
         .into_iter()
         .filter_map(|raw_entry| match raw_entry {
             Ok(path) => Some(path),
@@ -2349,9 +2355,18 @@ fn enter_directory(
             }
         })
         .filter(|dir_entry| should_display(&dir_entry, config))
-        .map(|dir_entry| PathData::new(dir_entry.path(), Some(dir_entry), None, config, false));
+        .map(|dir_entry| {
+            PathData::new(
+                dir_entry.path(),
+                Some(dir_entry),
+                None,
+                config,
+                false,
+                false,
+            )
+        });
 
-    new_entries.extend(iter);
+    new_entries.extend(new_paths);
 
     sort_entries(&mut new_entries, config);
 
@@ -2369,8 +2384,7 @@ fn enter_directory(
     if config.recursive {
         let new_dirs = new_entries
             .into_iter()
-            .skip(if config.files == Files::All { 2 } else { 0 })
-            .filter(|p| p.file_type().is_some_and(|ft| ft.is_dir()))
+            .filter(|p| !p.is_dot && p.file_type().is_some_and(|ft| ft.is_dir()))
             .rev();
 
         entries_stack.extend(new_dirs);
@@ -2910,8 +2924,10 @@ fn display_item_long(
             output_display.extend(b".");
         } else if is_acl_set {
             output_display.extend(b"+");
+        } else {
+            output_display.extend(b" ");
         }
-        output_display.extend(b" ");
+
         output_display.extend_pad_left(&display_symlink_count(md), padding.link_count);
 
         if config.long.owner {
@@ -3337,7 +3353,8 @@ fn display_item_name(
                         }
                     }
 
-                    let target_data = PathData::new(absolute_target, None, None, config, false);
+                    let target_data =
+                        PathData::new(absolute_target, None, None, config, false, false);
 
                     // If we have a symlink to a valid file, we use the metadata of said file.
                     // Because we use an absolute path, we can assume this is guaranteed to exist.
@@ -3473,15 +3490,26 @@ fn calculate_padding_collection(
         }
 
         if config.format == Format::Long {
-            let context_len = item.security_context(config).len();
+            #[cfg(any(not(unix), target_os = "android", target_os = "macos"))]
+            // TODO: See how Mac should work here
+            let is_acl_set = false;
+            #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
+            let is_acl_set = has_acl(item.display_name());
+
+            let context_len = if item.security_context(config).len() > 1 || is_acl_set {
+                // GNU `ls` uses a "." character to indicate a file with a security context,
+                // but not other alternate access method.
+                1
+            } else {
+                0
+            };
+
             let (link_count_len, uname_len, group_len, size_len, major_len, minor_len) =
                 display_dir_entry_size(item, config, state);
             padding_collections.link_count = link_count_len.max(padding_collections.link_count);
             padding_collections.uname = uname_len.max(padding_collections.uname);
             padding_collections.group = group_len.max(padding_collections.group);
-            if config.context {
-                padding_collections.context = context_len.max(padding_collections.context);
-            }
+            padding_collections.context = context_len.max(padding_collections.context);
             if items.len() == 1usize {
                 padding_collections.size = 0usize;
                 padding_collections.major = 0usize;
