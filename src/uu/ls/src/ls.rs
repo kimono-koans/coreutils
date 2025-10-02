@@ -3490,26 +3490,28 @@ fn calculate_padding_collection(
         }
 
         if config.format == Format::Long {
-            #[cfg(any(not(unix), target_os = "android", target_os = "macos"))]
-            // TODO: See how Mac should work here
-            let is_acl_set = false;
-            #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
-            let is_acl_set = has_acl(item.display_name());
-
-            let context_len = if item.security_context(config).len() > 1 || is_acl_set {
-                // GNU `ls` uses a "." character to indicate a file with a security context,
-                // but not other alternate access method.
-                1
-            } else {
-                0
-            };
+            let context_len = item.security_context(config).len();
 
             let (link_count_len, uname_len, group_len, size_len, major_len, minor_len) =
                 display_dir_entry_size(item, config, state);
             padding_collections.link_count = link_count_len.max(padding_collections.link_count);
+
+            {
+                #[cfg(any(not(unix), target_os = "android", target_os = "macos"))]
+                // TODO: See how Mac should work here
+                let is_acl_set = false;
+                #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
+                let is_acl_set = has_acl(item.display_name());
+                if context_len > 1 || is_acl_set {
+                    padding_collections.link_count += 1;
+                }
+            }
+
             padding_collections.uname = uname_len.max(padding_collections.uname);
             padding_collections.group = group_len.max(padding_collections.group);
-            padding_collections.context = context_len.max(padding_collections.context);
+            if config.context {
+                padding_collections.context = context_len.max(padding_collections.context);
+            }
             if items.len() == 1usize {
                 padding_collections.size = 0usize;
                 padding_collections.major = 0usize;
