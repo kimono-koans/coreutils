@@ -1838,7 +1838,7 @@ impl PathData {
                         md.get_or_init(|| Some(pb_md));
                     }
                     Err(err) if command_line => {
-                        Self::handle_metadata_error(&p_buf, command_line, err);
+                        handle_io_err(&p_buf, command_line, err);
                         ft.get_or_init(|| None);
                         md.get_or_init(|| None);
                     }
@@ -1888,7 +1888,7 @@ impl PathData {
                             }
                         }
 
-                        Self::handle_metadata_error(self.path(), self.command_line, err);
+                        self.handle_io_err(err);
 
                         None
                     }
@@ -1896,18 +1896,6 @@ impl PathData {
                 }
             })
             .as_ref()
-    }
-
-    fn handle_metadata_error(path: &Path, command_line: bool, err: std::io::Error) {
-        // FIXME: A bit tricky to propagate the result here
-        let mut out = stdout();
-        let _ = out.flush();
-
-        show!(LsError::IOErrorContext(
-            path.to_path_buf(),
-            err,
-            command_line
-        ));
     }
 
     fn file_type(&self) -> Option<&FileType> {
@@ -1929,7 +1917,7 @@ impl PathData {
 
     fn security_context(&self, config: &Config) -> &str {
         self.security_context
-            .get_or_init(|| get_security_context(&self.p_buf, self.must_dereference, config).into())
+            .get_or_init(|| self.get_security_context(config).into())
     }
 
     fn path(&self) -> &Path {
@@ -1938,6 +1926,64 @@ impl PathData {
 
     fn display_name(&self) -> &OsStr {
         &self.display_name
+    }
+
+    fn handle_io_err(&self, err: std::io::Error) {
+        handle_io_err(self.path(), self.command_line, err);
+    }
+
+    /// This returns the `SELinux` security context as UTF8 `String`.
+    /// In the long term this should be changed to [`OsStr`], see discussions at #2621/#2656
+    fn get_security_context<'a>(&self, config: &'a Config) -> Cow<'a, str> {
+        static SUBSTITUTE_STRING: &str = "?";
+
+        // If we must dereference, ensure that the symlink is actually valid even if the system
+        // does not support SELinux.
+        // Conforms to the GNU coreutils where a dangling symlink results in exit code 1.
+        if self.must_dereference {
+            if let Err(err) = get_metadata_with_deref_opt(self.path(), self.must_dereference) {
+                // The Path couldn't be dereferenced, so return early and set exit code 1
+                // to indicate a minor error
+                // Only show error when context display is requested to avoid duplicate messages
+                if config.context {
+                    self.handle_io_err(err);
+                }
+                return Cow::Borrowed(SUBSTITUTE_STRING);
+            }
+        }
+
+        if config.selinux_supported {
+            #[cfg(feature = "selinux")]
+            {
+                match selinux::SecurityContext::of_path(self.path(), self.must_dereference, false) {
+                    Err(_r) => {
+                        // TODO: show the actual reason why it failed
+                        show_warning!("failed to get security context of: {}", self.path().quote());
+                        return Cow::Borrowed(SUBSTITUTE_STRING);
+                    }
+                    Ok(None) => return Cow::Borrowed(SUBSTITUTE_STRING),
+                    Ok(Some(context)) => {
+                        let context = context.as_bytes();
+
+                        let context = context.strip_suffix(&[0]).unwrap_or(context);
+
+                        let res: String = String::from_utf8(context.to_vec()).unwrap_or_else(|e| {
+                            show_warning!(
+                                "getting security context of: {}: {}",
+                                self.path().quote(),
+                                e.to_string()
+                            );
+
+                            String::from_utf8_lossy(context).to_string()
+                        });
+
+                        return Cow::Owned(res);
+                    }
+                }
+            }
+        }
+
+        Cow::Borrowed(SUBSTITUTE_STRING)
     }
 }
 
@@ -1990,6 +2036,18 @@ impl Clone for PathData {
             command_line: self.command_line,
         }
     }
+}
+
+fn handle_io_err(path: &Path, command_line: bool, err: std::io::Error) {
+    // FIXME: A bit tricky to propagate the result here
+    let mut out = stdout();
+    let _ = out.flush();
+
+    show!(LsError::IOErrorContext(
+        path.to_path_buf(),
+        err,
+        command_line
+    ));
 }
 
 /// Show the directory name in the case where several arguments are given to ls
@@ -2106,12 +2164,7 @@ pub fn list(locs: Vec<&Path>, config: &Config) -> UResult<()> {
         let read_dir = match std::fs::read_dir(path_data.path()) {
             Err(err) => {
                 // flush stdout buffer before the error to preserve formatting and order
-                state.out.flush()?;
-                show!(LsError::IOErrorContext(
-                    path_data.path().to_path_buf(),
-                    err,
-                    path_data.command_line
-                ));
+                path_data.handle_io_err(err);
                 continue;
             }
             Ok(rd) => rd,
@@ -2146,6 +2199,7 @@ pub fn list(locs: Vec<&Path>, config: &Config) -> UResult<()> {
     if config.dired && !config.hyperlink {
         dired::print_dired_output(config, &dired, &mut state.out)?;
     }
+
     Ok(())
 }
 
@@ -2371,12 +2425,7 @@ fn recurse_directories(
         while let Some(item) = entries_stack.pop() {
             match fs::read_dir(&item.p_buf) {
                 Err(err) => {
-                    state.out.flush()?;
-                    show!(LsError::IOErrorContext(
-                        item.p_buf.clone(),
-                        err,
-                        item.command_line
-                    ));
+                    item.handle_io_err(err);
                 }
                 Ok(rd) => {
                     #[cfg(target_os = "windows")]
@@ -2423,10 +2472,10 @@ fn recurse_directories(
 
 fn get_metadata_with_deref_opt(p_buf: &Path, dereference: bool) -> std::io::Result<Metadata> {
     if dereference {
-        return p_buf.metadata();
+        p_buf.metadata()
+    } else {
+        p_buf.symlink_metadata()
     }
-
-    p_buf.symlink_metadata()
 }
 
 fn display_dir_entry_size(
@@ -3325,11 +3374,7 @@ fn display_item_name(
                 }
             }
             Err(err) => {
-                show!(LsError::IOErrorContext(
-                    path.path().to_path_buf(),
-                    err,
-                    false
-                ));
+                path.handle_io_err(err);
             }
         }
     }
@@ -3399,64 +3444,6 @@ fn display_symlink_count(metadata: &Metadata) -> String {
 #[cfg(unix)]
 fn display_inode(metadata: &Metadata) -> String {
     get_inode(metadata)
-}
-
-/// This returns the `SELinux` security context as UTF8 `String`.
-/// In the long term this should be changed to [`OsStr`], see discussions at #2621/#2656
-fn get_security_context<'a>(
-    path: &'a Path,
-    must_dereference: bool,
-    config: &'a Config,
-) -> Cow<'a, str> {
-    static SUBSTITUTE_STRING: &str = "?";
-
-    // If we must dereference, ensure that the symlink is actually valid even if the system
-    // does not support SELinux.
-    // Conforms to the GNU coreutils where a dangling symlink results in exit code 1.
-    if must_dereference {
-        if let Err(err) = get_metadata_with_deref_opt(path, must_dereference) {
-            // The Path couldn't be dereferenced, so return early and set exit code 1
-            // to indicate a minor error
-            // Only show error when context display is requested to avoid duplicate messages
-            if config.context {
-                show!(LsError::IOErrorContext(path.to_path_buf(), err, false));
-            }
-            return Cow::Borrowed(SUBSTITUTE_STRING);
-        }
-    }
-
-    if config.selinux_supported {
-        #[cfg(feature = "selinux")]
-        {
-            match selinux::SecurityContext::of_path(path, must_dereference, false) {
-                Err(_r) => {
-                    // TODO: show the actual reason why it failed
-                    show_warning!("failed to get security context of: {}", path.quote());
-                    return Cow::Borrowed(SUBSTITUTE_STRING);
-                }
-                Ok(None) => return Cow::Borrowed(SUBSTITUTE_STRING),
-                Ok(Some(context)) => {
-                    let context = context.as_bytes();
-
-                    let context = context.strip_suffix(&[0]).unwrap_or(context);
-
-                    let res: String = String::from_utf8(context.to_vec()).unwrap_or_else(|e| {
-                        show_warning!(
-                            "getting security context of: {}: {}",
-                            path.quote(),
-                            e.to_string()
-                        );
-
-                        String::from_utf8_lossy(context).to_string()
-                    });
-
-                    return Cow::Owned(res);
-                }
-            }
-        }
-    }
-
-    Cow::Borrowed(SUBSTITUTE_STRING)
 }
 
 #[cfg(unix)]
