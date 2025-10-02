@@ -2097,8 +2097,6 @@ struct ListState<'a> {
 
 #[allow(clippy::cognitive_complexity)]
 pub fn list(locs: Vec<&Path>, config: &Config) -> UResult<()> {
-    let mut files = Vec::<PathData>::new();
-    let mut dirs = Vec::<PathData>::new();
     let mut dired = DiredOutput::default();
     let initial_locs_len = locs.len();
 
@@ -2116,33 +2114,25 @@ pub fn list(locs: Vec<&Path>, config: &Config) -> UResult<()> {
             ..=SystemTime::now(),
     };
 
-    for loc in locs {
-        let path_data = PathData::new(PathBuf::from(loc), None, None, config, true);
-
-        // Getting metadata here is no big deal as it's just the CWD
-        // and we really just want to know if the strings exist as files/dirs
-        //
-        // Proper GNU handling is don't show if dereferenced symlink DNE
-        // but only for the base dir, for a child dir show, and print ?s
-        // in long format
-        if path_data.metadata().is_none() {
-            continue;
-        }
-
-        let show_dir_contents = match path_data.file_type() {
+    let (mut dirs, mut files): (Vec<PathData>, Vec<PathData>) = locs
+        .into_iter()
+        .map(|loc| PathData::new(PathBuf::from(loc), None, None, config, true))
+        .filter(|path_data| {
+            // Getting metadata here is no big deal as it's just the CWD
+            // and we really just want to know if the strings exist as files/dirs
+            //
+            // Proper GNU handling is don't show if dereferenced symlink DNE
+            // but only for the base dir, for a child dir show, and print ?s
+            // in long format
+            path_data.file_type().is_some()
+        })
+        .partition(|path_data| match path_data.file_type() {
             Some(ft) => !config.directory && ft.is_dir(),
             None => {
                 set_exit_code(1);
                 false
             }
-        };
-
-        if show_dir_contents {
-            dirs.push(path_data);
-        } else {
-            files.push(path_data);
-        }
-    }
+        });
 
     sort_entries(&mut files, config);
     sort_entries(&mut dirs, config);
@@ -2158,43 +2148,46 @@ pub fn list(locs: Vec<&Path>, config: &Config) -> UResult<()> {
 
     display_items(&files, config, &mut state, &mut dired)?;
 
-    for (pos, path_data) in dirs.iter().enumerate() {
-        // Do read_dir call here to match GNU semantics by printing
-        // read_dir errors before directory headings, names and totals
-        let read_dir = match std::fs::read_dir(path_data.path()) {
-            Err(err) => {
-                // flush stdout buffer before the error to preserve formatting and order
-                path_data.handle_io_err(err);
-                continue;
-            }
-            Ok(rd) => rd,
-        };
-
-        // Print dir heading - name... 'total' comes after error display
-        if initial_locs_len > 1 || config.recursive {
-            if pos.eq(&0usize) && files.is_empty() {
-                if config.dired {
-                    dired::indent(&mut state.out)?;
+    dirs.iter()
+        .enumerate()
+        .filter_map(|(pos, path_data)| {
+            // Do read_dir call here to match GNU semantics by printing
+            // read_dir errors before directory headings, names and totals
+            match std::fs::read_dir(path_data.path()) {
+                Err(err) => {
+                    // flush stdout buffer before the error to preserve formatting and order
+                    path_data.handle_io_err(err);
+                    None
                 }
-                show_dir_name(path_data, &mut state.out, config)?;
-                writeln!(state.out)?;
-                if config.dired {
-                    // First directory displayed
-                    let dir_len = path_data.display_name().len();
-                    // add the //SUBDIRED// coordinates
-                    dired::calculate_subdired(&mut dired, dir_len);
-                    // Add the padding for the dir name
-                    dired::add_dir_name(&mut dired, dir_len);
-                }
-            } else {
-                writeln!(state.out)?;
-                show_dir_name(path_data, &mut state.out, config)?;
-                writeln!(state.out)?;
+                Ok(rd) => Some(rd).map(|rd| (rd, pos, path_data)),
             }
-        }
+        })
+        .try_for_each(|(read_dir, pos, path_data)| {
+            // Print dir heading - name... 'total' comes after error display
+            if initial_locs_len > 1 || config.recursive {
+                if pos.eq(&0usize) && files.is_empty() {
+                    if config.dired {
+                        dired::indent(&mut state.out)?;
+                    }
+                    show_dir_name(path_data, &mut state.out, config)?;
+                    writeln!(state.out)?;
+                    if config.dired {
+                        // First directory displayed
+                        let dir_len = path_data.display_name().len();
+                        // add the //SUBDIRED// coordinates
+                        dired::calculate_subdired(&mut dired, dir_len);
+                        // Add the padding for the dir name
+                        dired::add_dir_name(&mut dired, dir_len);
+                    }
+                } else {
+                    writeln!(state.out)?;
+                    show_dir_name(path_data, &mut state.out, config)?;
+                    writeln!(state.out)?;
+                }
+            }
 
-        recurse_directories(path_data, read_dir, config, &mut state, &mut dired)?;
-    }
+            recurse_directories(path_data, read_dir, config, &mut state, &mut dired)
+        })?;
 
     if config.dired && !config.hyperlink {
         dired::print_dired_output(config, &dired, &mut state.out)?;
@@ -2346,22 +2339,19 @@ fn enter_directory(
     };
 
     // Convert those entries to the PathData struct
-    for raw_entry in read_dir {
-        let dir_entry = match raw_entry {
-            Ok(path) => path,
+    let iter = read_dir
+        .into_iter()
+        .filter_map(|raw_entry| match raw_entry {
+            Ok(path) => Some(path),
             Err(err) => {
-                state.out.flush()?;
-                show!(LsError::IOError(err));
-                continue;
+                handle_io_err(path_data.path(), path_data.command_line, err);
+                None
             }
-        };
+        })
+        .filter(|dir_entry| should_display(&dir_entry, config))
+        .map(|dir_entry| PathData::new(dir_entry.path(), Some(dir_entry), None, config, false));
 
-        if should_display(&dir_entry, config) {
-            let entry_path_data =
-                PathData::new(dir_entry.path(), Some(dir_entry), None, config, false);
-            new_entries.push(entry_path_data);
-        }
-    }
+    new_entries.extend(iter);
 
     sort_entries(&mut new_entries, config);
 
